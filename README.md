@@ -63,11 +63,25 @@ pip install -r requirements-optional.txt
 ### 美股因子挖掘（推薦新手）
 
 ```bash
-# 訓練 SPY 策略
+# 訓練 SPY 策略（使用默認參數）
 python times_us.py --symbol SPY
+
+# 增加訓練強度（推薦）
+python times_us.py --symbol SPY --iterations 600 --batch_size 2048
+
+# 自定義時間範圍（訓練：2018~2023，測試：2023~2025）
+python times_us.py --symbol AAPL --start 2018-01-01 --end 2023-01-01 --test_end 2025-01-01
 
 # 查看生成的信號
 python signal_generator.py --strategy SPY_best_strategy.json
+```
+
+**輸出示例：**
+```
+✅ NVDA Data Ready!
+   Total: 1523 days | Train: 1258 | Test: 265
+   Train Period: 2020-01-02 ~ 2024-12-31
+   Test Period : 2025-01-02 ~ 2026-01-23
 ```
 
 ### A股因子挖掘
@@ -140,6 +154,7 @@ AlphaGPT/
 ├── times.py             # 🇨🇳 A股回測腳本
 ├── times_us.py          # 🇺🇸 美股回測腳本
 ├── signal_generator.py  # 📡 實時信號生成器
+├── backtest_strategy.py # 📊 策略回測腳本
 │
 ├── requirements.txt     # 核心依賴
 └── requirements-optional.txt  # 可選依賴
@@ -217,7 +232,25 @@ python times_us.py \
     --end 2023-01-01 \
     --test_end 2025-01-01 \
     --iterations 600
+
+# 使用回測腳本測試已有策略
+python backtest_strategy.py \
+    --strategy NVDA_best_strategy.json \
+    --tickers SPY,QQQ,AAPL \
+    --period 6mo \
+    --capital 100000
 ```
+
+**命令行參數：**
+
+| 參數 | 說明 | 默認值 |
+|------|------|--------|
+| `--symbol` | 股票代碼 | SPY |
+| `--start` | 數據開始日期 | 2015-01-01 |
+| `--end` | 訓練/測試分界點 | 2024-01-01 |
+| `--test_end` | 數據結束日期 | 2025-01-01 |
+| `--iterations` | 訓練迭代次數 | 400 |
+| `--batch_size` | 批次大小 | 1024 |
 
 **支持的標的：**
 
@@ -241,6 +274,31 @@ python signal_generator.py --symbols SPY,QQQ,AAPL,MSFT,NVDA
 # 監控模式（每分鐘更新）
 python signal_generator.py --strategy SPY_best_strategy.json --monitor
 ```
+
+### 策略回測
+
+使用 `backtest_strategy.py` 對已訓練的策略進行回測：
+
+```bash
+# 基本用法
+python backtest_strategy.py --strategy NVDA_best_strategy.json --tickers SPY,QQQ
+
+# 完整參數
+python backtest_strategy.py \
+    --strategy NVDA_best_strategy.json \
+    --tickers SPY,QQQ,AAPL,MSFT \
+    --period 1y \
+    --capital 100000
+```
+
+**回測參數：**
+
+| 參數 | 說明 | 默認值 |
+|------|------|--------|
+| `--strategy` | 策略 JSON 文件 | 必填 |
+| `--tickers` | 測試標的（逗號分隔） | SPY,QQQ |
+| `--period` | 回測週期 | 6mo |
+| `--capital` | 初始資金 | 100000 |
 
 ### 在代碼中使用
 
@@ -269,14 +327,20 @@ results = gen.scan_multiple(['AAPL', 'MSFT', 'NVDA'])
 
 ```python
 DEFAULT_SYMBOL = 'SPY'           # 默認標的
-START_DATE = '2015-01-01'        # 訓練開始
-END_DATE = '2024-01-01'          # 訓練結束
-TEST_END_DATE = '2025-01-01'     # 測試結束
+START_DATE = '2015-01-01'        # 數據開始日期
+END_DATE = '2024-01-01'          # 訓練/測試分界點 ← 關鍵！
+TEST_END_DATE = '2025-01-01'     # 數據結束日期
 BATCH_SIZE = 1024                # 批次大小
 TRAIN_ITERATIONS = 400           # 訓練輪數
 MAX_SEQ_LEN = 8                  # 公式最大長度
 COST_RATE = 0.0001               # 交易成本
 ```
+
+**⚠️ 日期劃分邏輯：**
+- **訓練集**：`START_DATE` ~ `END_DATE`（模型學習期間）
+- **測試集**：`END_DATE` ~ `TEST_END_DATE`（樣本外驗證）
+
+這種設計確保測試集是真正的「樣本外」數據，避免數據洩漏。
 
 ### A股配置 (`times.py`)
 
@@ -371,9 +435,10 @@ W -= decay_rate * Y
 | 文件 | 說明 |
 |------|------|
 | `{SYMBOL}_best_strategy.json` | 最優策略公式 |
-| `{SYMBOL}_strategy_performance.png` | 回測曲線圖 |
+| `{SYMBOL}_strategy_performance.png` | 回測曲線圖（訓練時生成） |
+| `{SYMBOL}_backtest.png` | 回測曲線圖（回測時生成） |
+| `{SYMBOL}_trade_log.csv` | 交易記錄（含日期、價格、動作） |
 | `data_cache_{SYMBOL}.parquet` | 數據緩存 |
-| `training_history.json` | 訓練歷史 |
 
 ### 策略文件格式
 

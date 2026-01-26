@@ -5,10 +5,10 @@ AlphaGPT Signal Generator - 實時信號生成器
 
 Usage:
     # 查看今日信號
-    python signal_generator.py --strategy SPY_best_strategy.json
+    python signal_generator.py --strategy output/SPY_best_strategy.json
     
     # 監控模式（每分鐘更新）
-    python signal_generator.py --strategy SPY_best_strategy.json --monitor
+    python signal_generator.py --strategy output/SPY_best_strategy.json --monitor
     
     # 批量掃描多個標的
     python signal_generator.py --symbols SPY,QQQ,AAPL,MSFT,NVDA
@@ -16,12 +16,22 @@ Usage:
 
 import json
 import argparse
+import os
+import sys
 import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import torch
 import yfinance as yf
+
+# Windows 編碼修復
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# 輸出目錄
+OUTPUT_DIR = 'output'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==================== 算子定義（與訓練時一致）====================
 @torch.jit.script
@@ -420,14 +430,27 @@ if __name__ == "__main__":
     
     # 加載策略
     if args.strategy:
-        generator = SignalGenerator(strategy_file=args.strategy)
-        print(f"✅ Loaded strategy from {args.strategy}")
+        # 如果路徑不存在，嘗試在 output/ 目錄下查找
+        strategy_path = args.strategy
+        if not os.path.exists(strategy_path):
+            alt_path = os.path.join(OUTPUT_DIR, args.strategy)
+            if os.path.exists(alt_path):
+                strategy_path = alt_path
+        
+        generator = SignalGenerator(strategy_file=strategy_path)
+        print(f"✅ Loaded strategy from {strategy_path}")
     else:
-        # 如果沒有指定策略，使用一個簡單的默認公式
-        # 這是一個示例：MA20(RET) - 20日動量
-        default_formula = [10, 0]  # MA20(RET)
-        generator = SignalGenerator(formula_tokens=default_formula)
-        print("⚠️ No strategy file specified, using default formula: MA20(RET)")
+        # 嘗試查找 output/ 目錄下最新的策略文件
+        strategy_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('_best_strategy.json')]
+        if strategy_files:
+            latest_strategy = os.path.join(OUTPUT_DIR, sorted(strategy_files)[-1])
+            generator = SignalGenerator(strategy_file=latest_strategy)
+            print(f"✅ Auto-loaded latest strategy: {latest_strategy}")
+        else:
+            # 如果沒有策略文件，使用默認公式
+            default_formula = [10, 0]  # MA20(RET)
+            generator = SignalGenerator(formula_tokens=default_formula)
+            print("⚠️ No strategy file found, using default formula: MA20(RET)")
     
     print(f"📜 Formula: {generator.formula_readable}")
     print(f"📋 Scanning: {', '.join(symbols)}")
