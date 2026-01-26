@@ -1,6 +1,7 @@
 # AlphaGPT - Optional Dependencies
 # These are only needed for experimental/research scripts:
 #   - times.py (Chinese stock market backtesting)
+#   - times_us.py (US stock market backtesting)
 #   - lord/experiment.py (LoRD regularization experiments)
 
 # Data & Visualization for Research Scripts
@@ -9,3 +10,6 @@ seaborn>=0.12.0
 
 # Chinese Stock Market Data (for times.py only)
 tushare>=1.2.89
+
+# US Stock Market Data (for times_us.py)
+yfinance>=0.2.36
