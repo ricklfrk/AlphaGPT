@@ -27,7 +27,8 @@
 ### 環境要求
 
 - Python 3.10+
-- CUDA 11.8+（可選，用於 GPU 加速）
+- CUDA 11.8 / 12.1 / 12.4（推薦，用於 GPU 加速）
+- NVIDIA GPU（推薦 RTX 3060 或更高）
 
 ### 安裝步驟
 
@@ -36,24 +37,49 @@
 git clone https://github.com/imbue-bit/AlphaGPT.git
 cd AlphaGPT
 
-# 安裝核心依賴
+# Step 1: 安裝 PyTorch（選擇對應的 CUDA 版本）
+
+# CUDA 11.8
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# CUDA 12.1
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# CUDA 12.4（最新）
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# CPU 版本（無 GPU）
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Step 2: 安裝其他依賴
 pip install -r requirements.txt
 
-# 安裝可選依賴（A股/美股回測）
+# Step 3: 安裝可選依賴（A股回測）
 pip install -r requirements-optional.txt
+```
+
+### 驗證 CUDA 安裝
+
+```python
+import torch
+print(f"PyTorch: {torch.__version__}")
+print(f"CUDA Available: {torch.cuda.is_available()}")
+print(f"CUDA Version: {torch.version.cuda}")
+print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
 ```
 
 ### 依賴說明
 
 | 依賴包 | 用途 |
 |--------|------|
-| `torch` | 深度學習框架 |
+| `torch` (CUDA) | 深度學習框架（GPU 加速） |
 | `pandas`, `numpy` | 數據處理 |
+| `yfinance` | 美股數據 |
+| `matplotlib` | 圖表繪製 |
 | `sqlalchemy`, `asyncpg` | 數據庫連接 |
 | `aiohttp` | 異步 HTTP |
 | `solana`, `solders` | Solana 區塊鏈交互 |
 | `streamlit`, `plotly` | 可視化看板 |
-| `yfinance` | 美股數據（可選）|
 | `tushare` | A股數據（可選）|
 
 ---

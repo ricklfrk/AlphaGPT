@@ -32,6 +32,9 @@ env/
 ENV/
 .venv/
 
+# output
+output/
+
 # IDE
 .vscode/
 .cursor/

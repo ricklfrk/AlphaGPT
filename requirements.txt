@@ -2,17 +2,26 @@
 # Python 3.10+ required (recommended: 3.11)
 #
 # Installation:
-#   pip3 install -r requirements.txt
-#   # Or use: pip install -r requirements.txt (if pip points to Python 3)
+#   # Step 1: Install PyTorch with CUDA (choose your CUDA version)
+#   # CUDA 11.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#   # CUDA 12.1:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   # CUDA 12.4:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
 #
-# For experimental scripts (times.py, lord/experiment.py):
-#   pip3 install -r requirements-optional.txt
-#   # Or use: pip install -r requirements-optional.txt (if pip points to Python 3)
+#   # Step 2: Install other dependencies
+#   pip install -r requirements.txt
+#
+# For CPU-only (no GPU):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
 
 # ===== Core Dependencies (Required for main pipeline) =====
 
 # Deep Learning & Numerical Computing
-torch>=2.0.0          # PyTorch for model training and inference
+# NOTE: Install PyTorch separately with CUDA support (see instructions above)
+# torch>=2.0.0        # Install via: pip install torch --index-url https://download.pytorch.org/whl/cu121
 numpy>=1.24.0         # Numerical operations
 
 # Data Processing & Database
@@ -42,8 +51,14 @@ plotly>=5.17.0        # Interactive charts
 
 # PostgreSQL
 psycopg2-binary>=2.9.10
-yfinance>0.0.1
+
+# ===== Market Data =====
+yfinance>=0.2.40      # Yahoo Finance API for US stock data
+
+# ===== Visualization =====
+matplotlib>=3.8.0     # Plotting and chart generation
+
 # ===== Optional Dependencies (For experimental scripts) =====
 # See requirements-optional.txt for:
-#   - matplotlib, seaborn (for lord/experiment.py visualization)
+#   - seaborn (for lord/experiment.py visualization)
 #   - tushare (for times.py Chinese stock market data)
