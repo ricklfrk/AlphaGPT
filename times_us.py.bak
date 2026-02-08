@@ -7,8 +7,13 @@ AlphaGPT - US Stock Version
 - ETF（如 SPY, QQQ, IWM）
 - 指數（如 ^GSPC, ^NDX）
 
+交易邏輯：
+- T日收盤信號 → T+1開盤建倉 → 持有直到信號改變
+- 收益計算: Close-to-Close 日收益
+
 Usage:
     python times_us.py --symbol SPY --start 2015-01-01 --end 2024-01-01
+    python times_us.py --symbol NVDA --iterations 600
 """
 
 import yfinance as yf
@@ -22,6 +27,7 @@ import os
 import sys
 import argparse
 import json
+from datetime import datetime
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -32,6 +38,39 @@ if sys.platform == 'win32':
 # ==================== 輸出目錄 ====================
 OUTPUT_DIR = 'output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ==================== 信號閾值配置 ====================
+# 當 |signal| < SIGNAL_THRESHOLD 時，離散倉位設為 0（觀望）
+# 這樣可以避免在信號微弱時頻繁交易
+DEFAULT_SIGNAL_THRESHOLD = 0.1  # 默認閾值
+
+def discretize_position(signal, threshold=DEFAULT_SIGNAL_THRESHOLD):
+    """
+    將連續信號 [-1, 1] 離散化為 {-1, 0, +1}
+    
+    Args:
+        signal: 連續信號值（標量或數組）
+        threshold: 信號閾值，|signal| < threshold 時返回 0
+    
+    Returns:
+        離散化後的倉位
+    """
+    import numpy as np
+    signal = np.asarray(signal)
+    pos = np.zeros_like(signal)
+    pos[signal > threshold] = 1
+    pos[signal < -threshold] = -1
+    return pos
+
+
+def create_output_folder(symbol):
+    """創建帶時間戳的獨立輸出子文件夾"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    folder_name = f"{symbol}_{timestamp}"
+    folder_path = os.path.join(OUTPUT_DIR, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+    return folder_path
 
 # ==================== 配置 ====================
 DEFAULT_SYMBOL = 'NVDA'           # 默認標的：S&P 500 ETF
@@ -117,7 +156,8 @@ OPS_CONFIG = [
 ]
 
 # ==================== 因子配置 ====================
-FEATURES = ['RET', 'RET5', 'RET20', 'VOL_CHG', 'V_RET', 'TREND', 'ATR', 'RSI']
+FEATURES = ['RET', 'RET5', 'VOL_CHG', 'V_RET', 'TREND']
+
 
 VOCAB = FEATURES + [cfg[0] for cfg in OPS_CONFIG]
 VOCAB_SIZE = len(VOCAB)
@@ -277,25 +317,38 @@ class USDataEngine:
 
         # 7. ATR (Average True Range) - 波動率指標
         tr1 = high - low
-        tr2 = np.abs(high - np.roll(close, 1))
-        tr3 = np.abs(low - np.roll(close, 1))
+        prev_close = np.roll(close, 1)
+        prev_close[0] = close[0]  # 修復 np.roll 的邊界副作用
+        tr2 = np.abs(high - prev_close)
+        tr3 = np.abs(low - prev_close)
         tr = np.maximum(np.maximum(tr1, tr2), tr3)
         atr = pd.Series(tr).rolling(14).mean().fillna(0).values.astype(np.float32)
         atr_norm = atr / (close + 1e-6)  # 標準化
 
-        # 8. RSI (Relative Strength Index)
+        # 8. RSI (Relative Strength Index) - 改用 EMA (Wilder's Smoothing)
         delta = pd.Series(close).diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / (loss + 1e-6)
         rsi = (100 - 100 / (1 + rs)).fillna(50).values.astype(np.float32)
-        rsi_norm = (rsi - 50) / 50  # 標準化到 [-1, 1]
+        rsi_norm = (rsi - 50) / 16.0  # 標準化到約 [-3, 3]，與 robust_norm 一致
 
-        # Robust Normalization
+        # ==================== 計算 split_idx（提前計算，用於 robust_norm） ====================
+        # 移除時區信息以便比較
+        dates_naive = self.dates.dt.tz_localize(None) if self.dates.dt.tz is not None else self.dates
+        end_date_dt = pd.to_datetime(self.end_date)
+        split_mask = dates_naive < end_date_dt
+        self.split_idx = split_mask.sum()
+
+        # Robust Normalization - 只使用訓練集數據計算歸一化參數！
+        # 這是關鍵修復：避免 look-ahead bias（數據泄露）
         def robust_norm(x):
             x = x.astype(np.float32)
-            median = np.nanmedian(x)
-            mad = np.nanmedian(np.abs(x - median)) + 1e-6
+            # 只用訓練集數據計算 median 和 mad
+            x_train = x[:self.split_idx]
+            median = np.nanmedian(x_train)
+            mad = np.nanmedian(np.abs(x_train - median)) + 1e-6
+            # 用訓練集的統計量歸一化整個數據集
             res = (x - median) / mad
             return np.clip(res, -5, 5).astype(np.float32)
 
@@ -303,33 +356,36 @@ class USDataEngine:
         self.feat_data = torch.stack([
             torch.from_numpy(robust_norm(ret)).to(DEVICE),
             torch.from_numpy(robust_norm(ret5)).to(DEVICE),
-            torch.from_numpy(robust_norm(ret20)).to(DEVICE),
             torch.from_numpy(robust_norm(vol_chg)).to(DEVICE),
             torch.from_numpy(robust_norm(v_ret)).to(DEVICE),
-            torch.from_numpy(robust_norm(trend)).to(DEVICE),
-            torch.from_numpy(robust_norm(atr_norm)).to(DEVICE),
-            torch.from_numpy(rsi_norm).to(DEVICE),  # RSI 已經標準化
+            torch.from_numpy(robust_norm(trend)).to(DEVICE)
         ])
+        
+        # 保存歸一化參數供回測使用
+        self.norm_params = {
+            'ret': {'median': float(np.nanmedian(ret[:self.split_idx])), 
+                    'mad': float(np.nanmedian(np.abs(ret[:self.split_idx] - np.nanmedian(ret[:self.split_idx]))) + 1e-6)},
+            'ret5': {'median': float(np.nanmedian(ret5[:self.split_idx])), 
+                     'mad': float(np.nanmedian(np.abs(ret5[:self.split_idx] - np.nanmedian(ret5[:self.split_idx]))) + 1e-6)},
+            'vol_chg': {'median': float(np.nanmedian(vol_chg[:self.split_idx])), 
+                        'mad': float(np.nanmedian(np.abs(vol_chg[:self.split_idx] - np.nanmedian(vol_chg[:self.split_idx]))) + 1e-6)},
+            'v_ret': {'median': float(np.nanmedian(v_ret[:self.split_idx])), 
+                      'mad': float(np.nanmedian(np.abs(v_ret[:self.split_idx] - np.nanmedian(v_ret[:self.split_idx]))) + 1e-6)},
+            'trend': {'median': float(np.nanmedian(trend[:self.split_idx])), 
+                      'mad': float(np.nanmedian(np.abs(trend[:self.split_idx] - np.nanmedian(trend[:self.split_idx]))) + 1e-6)},
+        }
 
-        # 目標收益 (Open-to-Open)
+        # ==================== 目標收益計算 ====================
         open_tensor = torch.from_numpy(open_).to(DEVICE)
-        open_t1 = torch.roll(open_tensor, -1)
-        open_t2 = torch.roll(open_tensor, -2)
-        self.target_oto_ret = (open_t2 - open_t1) / (open_t1 + 1e-6)
-        self.target_oto_ret[-2:] = 0.0
+        close_tensor = torch.from_numpy(close).to(DEVICE)
 
         self.raw_open = open_tensor
-        self.raw_close = torch.from_numpy(close).to(DEVICE)
-
-        # 根據 END_DATE 劃分訓練集和測試集（而不是 80/20 自動劃分）
-        # 訓練集：start_date ~ end_date
-        # 測試集：end_date ~ test_end_date
-        # 移除時區信息以便比較
-        dates_naive = self.dates.dt.tz_localize(None) if self.dates.dt.tz is not None else self.dates
-        end_date_dt = pd.to_datetime(self.end_date)
-        split_mask = dates_naive < end_date_dt
-        self.split_idx = split_mask.sum()
+        self.raw_close = close_tensor
         
+        # 使用 Close-to-Close 日收益率
+        self.benchmark_ret = torch.from_numpy(ret).to(DEVICE)
+
+        # split_idx 已在前面計算（用於 robust_norm）
         # 計算實際日期範圍
         train_start = self.dates.iloc[0].strftime('%Y-%m-%d')
         train_end = self.dates.iloc[self.split_idx - 1].strftime('%Y-%m-%d') if self.split_idx > 0 else train_start
@@ -346,12 +402,15 @@ class USDataEngine:
 
 # ==================== 因子挖掘器 ====================
 class DeepQuantMiner:
-    def __init__(self, engine):
+    def __init__(self, engine, signal_threshold=DEFAULT_SIGNAL_THRESHOLD):
         self.engine = engine
+        self.signal_threshold = signal_threshold
         self.model = AlphaGPT().to(DEVICE)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=3e-4, weight_decay=1e-5)
         self.best_sharpe = -10.0
         self.best_formula_tokens = None
+        # 記錄訓練歷史
+        self.history = []  # [(iteration, sortino, formula_tokens, formula_str), ...]
 
     def get_strict_mask(self, open_slots, step):
         B = open_slots.shape[0]
@@ -371,11 +430,17 @@ class DeepQuantMiner:
         return mask
 
     def solve_one(self, tokens):
+        """
+        解析並執行因子公式
+        
+        注意：時序算子期望輸入是 [B, T] 形狀，所以需要 unsqueeze/squeeze 處理
+        """
         stack = []
         try:
             for t in reversed(tokens):
                 if t < len(FEATURES):
-                    stack.append(self.engine.feat_data[t])
+                    # 特徵是 [T] 形狀，unsqueeze 成 [1, T] 供時序算子使用
+                    stack.append(self.engine.feat_data[t].unsqueeze(0))
                 else:
                     arity = OP_ARITY_MAP[t]
                     if len(stack) < arity: raise ValueError
@@ -388,6 +453,9 @@ class DeepQuantMiner:
 
             if len(stack) >= 1:
                 final = stack[-1]
+                # squeeze 回 [T] 形狀
+                if final.dim() == 2 and final.shape[0] == 1:
+                    final = final.squeeze(0)
                 if final.std() < 1e-4: return None
                 return final
         except:
@@ -407,10 +475,21 @@ class DeepQuantMiner:
         return results, valid_mask
 
     def backtest(self, factors):
+        """
+        回測邏輯：正確的持倉邏輯
+        
+        收益計算: position * (Close[T] - Close[T-1]) / Close[T-1]
+        
+        核心邏輯：
+        - 信號 shift 1 天：T 的信號決定 T+1 的倉位
+        - T 收盤後計算信號 → T+1 開盤調整倉位
+        """
         if factors.shape[0] == 0: return torch.tensor([], device=DEVICE)
 
         split = self.engine.split_idx
-        target = self.engine.target_oto_ret[:split]
+        
+        # 使用 Close-to-Close 日收益
+        daily_ret = self.engine.benchmark_ret[:split]
 
         rewards = torch.zeros(factors.shape[0], device=DEVICE)
 
@@ -424,72 +503,120 @@ class DeepQuantMiner:
             sig = torch.tanh(f)
             
             # ========== 離散倉位 (Discrete) ==========
-            pos_discrete = torch.sign(sig)  # {-1, 0, 1}
+            threshold = self.signal_threshold
+            pos_signal = torch.zeros_like(sig)
+            pos_signal[sig > threshold] = 1
+            pos_signal[sig < -threshold] = -1
             
-            turnover_discrete = torch.abs(pos_discrete - torch.roll(pos_discrete, 1))
-            if turnover_discrete.numel() > 0:
-                turnover_discrete[0] = 0.0
-            else:
+            # 正確的倉位邏輯：T 的信號決定 T+1 的倉位
+            # position[T+1] = signal[T]
+            # 所以 effective_position 需要 shift 1 天
+            effective_pos = torch.zeros_like(pos_signal)
+            effective_pos[1:] = pos_signal[:-1]  # shift by 1 day
+            
+            # 換手率
+            turnover = torch.abs(effective_pos - torch.roll(effective_pos, 1))
+            turnover[0] = torch.abs(effective_pos[0])
+            
+            # 收益計算：effective_pos[T] * daily_ret[T]
+            pnl = effective_pos * daily_ret - turnover * COST_RATE
+
+            if pnl.numel() < 10:
                 rewards[i] = -2.0
                 continue
 
-            pnl_discrete = pos_discrete * target - turnover_discrete * COST_RATE
+            mu = pnl.mean()
+            std = pnl.std() + 1e-6
 
-            if pnl_discrete.numel() < 10:
-                rewards[i] = -2.0
-                continue
-
-            mu_d = pnl_discrete.mean()
-            std_d = pnl_discrete.std() + 1e-6
-
-            downside_d = pnl_discrete[pnl_discrete < 0]
-            if downside_d.numel() > 5:
-                down_std_d = downside_d.std() + 1e-6
-                sortino_discrete = mu_d / down_std_d * 15.87
+            # Sortino ratio
+            downside = pnl[pnl < 0]
+            if downside.numel() > 5:
+                down_std = downside.std() + 1e-6
+                sortino = mu / down_std * 15.87
             else:
-                sortino_discrete = mu_d / std_d * 15.87
+                sortino = mu / std * 15.87
 
-            # 離散倉位懲罰
-            if mu_d < 0: sortino_discrete = -2.0
-            if turnover_discrete.mean() > 0.5: sortino_discrete -= 1.0
-            if (pos_discrete == 0).all(): sortino_discrete = -2.0
+            # 懲罰項
+            if mu < 0: sortino = -2.0
+            if turnover.mean() > 0.3: sortino -= 0.5  # 換手率過高懲罰
+            if (effective_pos == 0).sum() > split * 0.9: sortino = -2.0  # 幾乎不交易
 
-            # ========== 連續倉位 (Continuous) ==========
-            pos_continuous = sig  # [-1, 1]
-            
-            turnover_continuous = torch.abs(pos_continuous - torch.roll(pos_continuous, 1))
-            turnover_continuous[0] = 0.0
-
-            pnl_continuous = pos_continuous * target - turnover_continuous * COST_RATE
-
-            mu_c = pnl_continuous.mean()
-            std_c = pnl_continuous.std() + 1e-6
-
-            downside_c = pnl_continuous[pnl_continuous < 0]
-            if downside_c.numel() > 5:
-                down_std_c = downside_c.std() + 1e-6
-                sortino_continuous = mu_c / down_std_c * 15.87
-            else:
-                sortino_continuous = mu_c / std_c * 15.87
-
-            # 連續倉位懲罰
-            if mu_c < 0: sortino_continuous = -2.0
-            if (pos_continuous.abs() < 0.01).all(): sortino_continuous = -2.0
-
-            # ========== 綜合獎勵 ==========
-            # 離散權重 0.6，連續權重 0.4（偏向離散，因為學習效果更好）
-            combined_reward = 0.6 * sortino_discrete + 0.4 * sortino_continuous
-
-            rewards[i] = combined_reward
+            rewards[i] = sortino
 
         return torch.clamp(rewards, -3, 5)
+
+    def evaluate_formula(self, tokens):
+        """
+        評估單個公式在訓練集上的詳細指標（V2：使用正確的持倉邏輯）
+        
+        Returns:
+            dict: {'sortino', 'sharpe', 'total_ret', 'ann_ret', 'win_rate'} 或 None
+        """
+        factor = self.solve_one(tokens)
+        if factor is None:
+            return None
+        
+        split = self.engine.split_idx
+        # 使用 Close-to-Close 日收益
+        daily_ret = self.engine.benchmark_ret[:split]
+        f = factor[:split]
+        
+        if torch.isnan(f).all() or (f == 0).all():
+            return None
+        
+        sig = torch.tanh(f)
+        threshold = self.signal_threshold
+        
+        # 離散倉位
+        pos_signal = torch.zeros_like(sig)
+        pos_signal[sig > threshold] = 1
+        pos_signal[sig < -threshold] = -1
+        
+        # 正確的倉位邏輯：T 的信號決定 T+1 的倉位
+        effective_pos = torch.zeros_like(pos_signal)
+        effective_pos[1:] = pos_signal[:-1]
+        
+        turnover = torch.abs(effective_pos - torch.roll(effective_pos, 1))
+        turnover[0] = torch.abs(effective_pos[0])
+        
+        pnl = effective_pos * daily_ret - turnover * COST_RATE
+        
+        if pnl.numel() < 10:
+            return None
+        
+        # 計算指標
+        equity = (1 + pnl).cumprod(dim=0)
+        total_ret = (equity[-1] - 1).item()
+        n_days = len(pnl)
+        ann_ret = (equity[-1].item() ** (252 / n_days) - 1) if n_days > 0 else 0
+        
+        mu = pnl.mean().item()
+        std = pnl.std().item() + 1e-6
+        sharpe = (ann_ret - 0.02) / (std * (252 ** 0.5) + 1e-6)
+        
+        downside = pnl[pnl < 0]
+        if downside.numel() > 5:
+            down_std = downside.std().item() + 1e-6
+            sortino = mu / down_std * 15.87
+        else:
+            sortino = mu / std * 15.87
+        
+        win_rate = (pnl > 0).float().mean().item()
+        
+        return {
+            'sortino': sortino,
+            'sharpe': sharpe,
+            'total_ret': total_ret,
+            'ann_ret': ann_ret,
+            'win_rate': win_rate
+        }
 
     def train(self):
         print(f"🚀 Training AlphaGPT for {self.engine.symbol}...")
         print(f"   MAX_SEQ_LEN={MAX_SEQ_LEN} | BATCH={BATCH_SIZE} | ITER={TRAIN_ITERATIONS}")
         pbar = tqdm(range(TRAIN_ITERATIONS))
 
-        for _ in pbar:
+        for iteration in pbar:
             B = BATCH_SIZE
             open_slots = torch.ones(B, dtype=torch.long, device=DEVICE)
             log_probs, tokens = [], []
@@ -531,6 +658,35 @@ class DeepQuantMiner:
                     if current_best_score > self.best_sharpe:
                         self.best_sharpe = current_best_score
                         self.best_formula_tokens = seqs[valid_idx[best_sub_idx]].cpu().tolist()
+                        # 計算詳細指標
+                        formula_str = self.decode(self.best_formula_tokens)
+                        metrics = self.evaluate_formula(self.best_formula_tokens)
+                        
+                        if metrics:
+                            # 記錄更新歷史（包含詳細指標）
+                            self.history.append({
+                                'iteration': iteration + 1,
+                                'sortino': self.best_sharpe,
+                                'sharpe': metrics['sharpe'],
+                                'total_ret': metrics['total_ret'],
+                                'ann_ret': metrics['ann_ret'],
+                                'win_rate': metrics['win_rate'],
+                                'formula_tokens': self.best_formula_tokens,
+                                'formula_str': formula_str
+                            })
+                            # 打印更新信息
+                            tqdm.write(f"\n🆕 Iter {iteration+1}: Sortino={self.best_sharpe:.2f} | Sharpe={metrics['sharpe']:.2f} | Return={metrics['total_ret']:.1%} | {formula_str}")
+                        else:
+                            self.history.append({
+                                'iteration': iteration + 1,
+                                'sortino': self.best_sharpe,
+                                'sharpe': None,
+                                'total_ret': None,
+                                'ann_ret': None,
+                                'win_rate': None,
+                                'formula_tokens': self.best_formula_tokens,
+                                'formula_str': formula_str
+                            })
 
             adv = rewards - rewards.mean()
             loss = -(torch.stack(log_probs, 1).sum(1) * adv).mean()
@@ -540,6 +696,9 @@ class DeepQuantMiner:
             self.opt.step()
 
             pbar.set_postfix({'Valid': f"{len(valid_idx)/B:.1%}", 'BestSortino': f"{self.best_sharpe:.2f}"})
+        
+        # 訓練結束後打印歷史
+        self._print_training_history()
 
     def decode(self, tokens=None):
         if tokens is None: tokens = self.best_formula_tokens
@@ -553,6 +712,70 @@ class DeepQuantMiner:
             return f"{VOCAB[t]}({','.join(args)})"
         try: return _parse()
         except: return "Invalid"
+
+    def _print_training_history(self):
+        """打印訓練歷史：每次 BestSortino 更新時的公式和指標"""
+        if not self.history:
+            print("\n⚠️  No valid formula found during training!")
+            return
+        
+        print("\n" + "=" * 100)
+        print("📜 TRAINING HISTORY - Best Formula Updates (Train Set Metrics)")
+        print("=" * 100)
+        print(f"{'Iter':<6} {'Sortino':<10} {'Sharpe':<10} {'Return':<10} {'WinRate':<10} {'Formula':<50}")
+        print("-" * 100)
+        
+        for record in self.history:
+            iteration = record['iteration']
+            sortino = record['sortino']
+            sharpe = record.get('sharpe')
+            total_ret = record.get('total_ret')
+            win_rate = record.get('win_rate')
+            formula_str = record['formula_str']
+            
+            # 格式化數值
+            sharpe_str = f"{sharpe:.2f}" if sharpe is not None else "N/A"
+            ret_str = f"{total_ret:.1%}" if total_ret is not None else "N/A"
+            win_str = f"{win_rate:.1%}" if win_rate is not None else "N/A"
+            
+            # 截斷過長的公式
+            if len(formula_str) > 48:
+                formula_display = formula_str[:45] + "..."
+            else:
+                formula_display = formula_str
+            
+            print(f"{iteration:<6} {sortino:<10.2f} {sharpe_str:<10} {ret_str:<10} {win_str:<10} {formula_display:<50}")
+        
+        print("-" * 100)
+        print(f"📊 Total Updates: {len(self.history)} times")
+        
+        # 顯示最終最佳的詳細指標
+        if self.history:
+            final = self.history[-1]
+            print(f"🏆 Final Best:")
+            print(f"   Sortino  = {final['sortino']:.4f}")
+            if final.get('sharpe') is not None:
+                print(f"   Sharpe   = {final['sharpe']:.4f}")
+                print(f"   Return   = {final['total_ret']:.2%}")
+                print(f"   Win Rate = {final['win_rate']:.2%}")
+            print(f"   Formula  = {final['formula_str']}")
+        print("=" * 100)
+
+    def get_training_history(self):
+        """返回訓練歷史（用於保存到文件）"""
+        return [
+            {
+                'iteration': record['iteration'],
+                'sortino': record['sortino'],
+                'sharpe': record.get('sharpe'),
+                'total_ret': record.get('total_ret'),
+                'ann_ret': record.get('ann_ret'),
+                'win_rate': record.get('win_rate'),
+                'formula_tokens': record['formula_tokens'],
+                'formula_readable': record['formula_str']
+            }
+            for record in self.history
+        ]
 
 
 # ==================== 回測報告 ====================
@@ -583,9 +806,20 @@ def calc_metrics(daily_ret, equity):
         'profit_factor': profit_factor
     }
 
-def final_reality_check(miner, engine):
+def final_reality_check(miner, engine, output_folder):
+    """
+    最終回測報告
+    
+    Args:
+        miner: DeepQuantMiner 實例
+        engine: USDataEngine 實例
+        output_folder: 輸出文件夾路徑
+    """
+    threshold = miner.signal_threshold
+    
     print("\n" + "="*70)
     print(f"🔬 FINAL REALITY CHECK - {engine.symbol} (Out-of-Sample)")
+    print(f"📊 Signal Threshold: ±{threshold} (|signal| < {threshold} → 觀望)")
     print("="*70)
 
     formula_str = miner.decode()
@@ -602,31 +836,59 @@ def final_reality_check(miner, engine):
     split = engine.split_idx
     test_dates = engine.dates[split:]
     test_factors = factor_all[split:].cpu().numpy()
-    test_ret = engine.target_oto_ret[split:].cpu().numpy()
+    
+    # 使用 Close-to-Close 日收益
+    test_daily_ret = engine.benchmark_ret[split:].cpu().numpy()
 
     signal = np.tanh(test_factors)
     
-    # ========== 離散倉位 (Discrete) ==========
-    pos_discrete = np.sign(signal)  # {-1, 0, 1}
-    turnover_d = np.abs(pos_discrete - np.roll(pos_discrete, 1))
-    turnover_d[0] = 0
-    daily_ret_d = pos_discrete * test_ret - turnover_d * COST_RATE
+    # ========== 離散倉位 (Discrete) - V2 正確邏輯 ==========
+    # T 的信號決定 T+1 的倉位
+    pos_signal = discretize_position(signal, threshold)
+    
+    # Shift: signal[T] → position[T+1]
+    effective_pos = np.zeros_like(pos_signal)
+    effective_pos[1:] = pos_signal[:-1]
+    
+    turnover_d = np.abs(effective_pos - np.roll(effective_pos, 1))
+    turnover_d[0] = abs(effective_pos[0])
+    
+    daily_ret_d = effective_pos * test_daily_ret - turnover_d * COST_RATE
     equity_d = (1 + daily_ret_d).cumprod()
     metrics_d = calc_metrics(daily_ret_d, equity_d)
     
-    # ========== 連續倉位 (Continuous) ==========
-    pos_continuous = signal  # [-1, 1]
-    turnover_c = np.abs(pos_continuous - np.roll(pos_continuous, 1))
-    turnover_c[0] = 0
-    daily_ret_c = pos_continuous * test_ret - turnover_c * COST_RATE
+    # 更新 pos_discrete 為 effective_pos（用於統計和繪圖）
+    pos_discrete = effective_pos
+    
+    # ========== 連續倉位 (Continuous) - V2 正確邏輯 ==========
+    # Shift: signal[T] → position[T+1]
+    effective_pos_c = np.zeros_like(signal)
+    effective_pos_c[1:] = signal[:-1]
+    
+    turnover_c = np.abs(effective_pos_c - np.roll(effective_pos_c, 1))
+    turnover_c[0] = abs(effective_pos_c[0])
+    
+    daily_ret_c = effective_pos_c * test_daily_ret - turnover_c * COST_RATE
     equity_c = (1 + daily_ret_c).cumprod()
     metrics_c = calc_metrics(daily_ret_c, equity_c)
+    
+    pos_continuous = effective_pos_c
 
+    # ========== Buy & Hold 基準線 ==========
+    bench_ret = engine.benchmark_ret[split:].cpu().numpy()
+    bench_equity_arr = (1 + bench_ret).cumprod()
+    bench_total_ret = bench_equity_arr[-1] - 1
+    
     # ========== 輸出結果 ==========
     print("-" * 70)
     print(f"📅 Test Period    : {test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}")
     print("-" * 70)
-    print(f"{'指標':<18} {'離散倉位 (±1)':<20} {'連續倉位 (Signal)':<20}")
+    # 計算觀望天數比例
+    hold_ratio = (pos_discrete == 0).sum() / len(pos_discrete) * 100
+    print(f"📊 Position Stats : {(pos_discrete == 1).sum()} long | {(pos_discrete == -1).sum()} short | {(pos_discrete == 0).sum()} hold ({hold_ratio:.1f}%)")
+    print(f"📊 Buy & Hold     : {bench_total_ret:.2%} (標準 Close-to-Close)")
+    print("-" * 70)
+    print(f"{'指標':<18} {'離散倉位 (±1,0)':<20} {'連續倉位 (Signal)':<20}")
     print("-" * 70)
     print(f"{'📈 Total Return':<18} {metrics_d['total_ret']:>18.2%} {metrics_c['total_ret']:>18.2%}")
     print(f"{'📈 Ann. Return':<18} {metrics_d['ann_ret']:>18.2%} {metrics_c['ann_ret']:>18.2%}")
@@ -648,52 +910,76 @@ def final_reality_check(miner, engine):
     sharpe = metrics_d['sharpe']
     max_dd = metrics_d['max_dd']
 
-    # 繪圖 - 同時顯示離散和連續倉位
+    # 繪圖 - 同時顯示離散和連續倉位 + Position 圖表
     plt.style.use('bmh')
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [3, 2, 2]})
 
     # 上圖：淨值曲線（三條線：離散、連續、基準）
     ax1 = axes[0]
-    ax1.plot(test_dates, equity_d, label=f'Discrete (±1) | Sharpe {metrics_d["sharpe"]:.2f}', 
+    ax1.plot(test_dates, equity_d, label=f'Discrete (±1,0) | Sharpe {metrics_d["sharpe"]:.2f}', 
              linewidth=2, color='#2E86AB')
     ax1.plot(test_dates, equity_c, label=f'Continuous (Signal) | Sharpe {metrics_c["sharpe"]:.2f}', 
              linewidth=2, color='#28A745', linestyle='--')
     
-    bench_equity = (1 + test_ret).cumprod()
-    ax1.plot(test_dates, bench_equity, label=f'{engine.symbol} Buy & Hold', 
+    # Buy & Hold 用標準的 Close-to-Close 日收益率，而不是策略目標收益率
+    bench_ret = engine.benchmark_ret[split:].cpu().numpy()
+    bench_equity = (1 + bench_ret).cumprod()
+    bench_total_ret = bench_equity[-1] - 1
+    ax1.plot(test_dates, bench_equity, label=f'{engine.symbol} Buy & Hold ({bench_total_ret:.1%})', 
              alpha=0.5, linewidth=1.5, color='#A23B72')
     
     ax1.fill_between(test_dates, equity_d, alpha=0.2, color='#2E86AB')
-    ax1.set_title(f'{engine.symbol} AlphaGPT Strategy Comparison | Test: {test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}', fontsize=14)
+    ax1.set_title(f'{engine.symbol} AlphaGPT Strategy | Test: {test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}', fontsize=14)
     ax1.set_ylabel('Cumulative Return')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
 
-    # 下圖：回撤比較
+    # 中圖：Position 倉位圖
     ax2 = axes[1]
-    dd_d = 1 - equity_d / np.maximum.accumulate(equity_d)
-    dd_c = 1 - equity_c / np.maximum.accumulate(equity_c)
-    ax2.fill_between(test_dates, -dd_d * 100, alpha=0.5, color='#2E86AB', label=f'Discrete DD (Max: {metrics_d["max_dd"]:.1%})')
-    ax2.fill_between(test_dates, -dd_c * 100, alpha=0.5, color='#28A745', label=f'Continuous DD (Max: {metrics_c["max_dd"]:.1%})')
-    ax2.set_title('Drawdown Comparison (%)', fontsize=12)
-    ax2.set_ylabel('Drawdown %')
-    ax2.set_xlabel('Date')
-    ax2.legend(loc='lower left')
+    # 離散倉位用階梯圖
+    ax2.fill_between(test_dates, pos_discrete, step='mid', alpha=0.6, color='#2E86AB', label='Discrete Position')
+    # 連續倉位用線圖
+    ax2.plot(test_dates, pos_continuous, color='#28A745', alpha=0.7, linewidth=1, label='Continuous Signal')
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.axhline(y=threshold, color='red', linestyle='--', linewidth=0.8, alpha=0.5, label=f'Threshold (±{threshold})')
+    ax2.axhline(y=-threshold, color='red', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax2.set_title(f'Position (Long: {(pos_discrete == 1).sum()} | Short: {(pos_discrete == -1).sum()} | Hold: {(pos_discrete == 0).sum()} = {hold_ratio:.1f}%)', fontsize=12)
+    ax2.set_ylabel('Position')
+    ax2.set_ylim(-1.3, 1.3)
+    ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
 
+    # 下圖：回撤比較
+    ax3 = axes[2]
+    dd_d = 1 - equity_d / np.maximum.accumulate(equity_d)
+    dd_c = 1 - equity_c / np.maximum.accumulate(equity_c)
+    ax3.fill_between(test_dates, -dd_d * 100, alpha=0.5, color='#2E86AB', label=f'Discrete DD (Max: {metrics_d["max_dd"]:.1%})')
+    ax3.fill_between(test_dates, -dd_c * 100, alpha=0.5, color='#28A745', label=f'Continuous DD (Max: {metrics_c["max_dd"]:.1%})')
+    ax3.set_title('Drawdown Comparison (%)', fontsize=12)
+    ax3.set_ylabel('Drawdown %')
+    ax3.set_xlabel('Date')
+    ax3.legend(loc='lower left')
+    ax3.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    output_file = os.path.join(OUTPUT_DIR, f'{engine.symbol}_strategy_performance.png')
+    output_file = os.path.join(output_folder, 'strategy_performance.png')
     plt.savefig(output_file, dpi=150)
     print(f"📈 Chart saved to '{output_file}'")
 
-    # 保存策略（包含兩種倉位的指標）
-    strategy_file = os.path.join(OUTPUT_DIR, f'{engine.symbol}_best_strategy.json')
+    # 保存策略
+    strategy_file = os.path.join(output_folder, 'best_strategy.json')
     with open(strategy_file, 'w') as f:
         json.dump({
             'symbol': engine.symbol,
+            'signal_threshold': threshold,
             'formula_tokens': miner.best_formula_tokens,
             'formula_readable': formula_str,
             'train_sortino': float(miner.best_sharpe),
+            'train_period': f"{engine.start_date} ~ {engine.end_date}",
+            'test_period': f"{test_dates.iloc[0].date()} ~ {test_dates.iloc[-1].date()}",
+            'benchmark_return': float(bench_total_ret),  # Buy & Hold 收益率
+            # 歸一化參數（用於回測時保持一致）
+            'norm_params': engine.norm_params,
             # 離散倉位指標
             'discrete': {
                 'sharpe': float(metrics_d['sharpe']),
@@ -709,12 +995,14 @@ def final_reality_check(miner, engine):
                 'max_drawdown': float(metrics_c['max_dd']),
                 'win_rate': float(metrics_c['win_rate']),
                 'profit_factor': float(metrics_c['profit_factor'])
-            }
+            },
+            # 訓練歷史（每次 BestSortino 更新時的記錄）
+            'training_history': miner.get_training_history()
         }, f, indent=2)
     print(f"💾 Strategy saved to '{strategy_file}'")
     
     # 保存詳細報告文本文件
-    report_file = os.path.join(OUTPUT_DIR, f'{engine.symbol}_report.txt')
+    report_file = os.path.join(output_folder, 'report.txt')
     test_start_str = str(test_dates.iloc[0].date())
     test_end_str = str(test_dates.iloc[-1].date())
     
@@ -722,11 +1010,16 @@ def final_reality_check(miner, engine):
         "=" * 70,
         f"🔬 FINAL REALITY CHECK - {engine.symbol} (Out-of-Sample)",
         "=" * 70,
+        f"📊 Signal Threshold: ±{threshold} (|signal| < {threshold} → 觀望)",
+        f"📊 Position Stats : {(pos_discrete == 1).sum()} long | {(pos_discrete == -1).sum()} short | {(pos_discrete == 0).sum()} hold ({hold_ratio:.1f}%)",
+        f"📊 Buy & Hold     : {bench_total_ret:.2%} (Close-to-Close)",
+        "-" * 70,
         f"📜 Strategy Formula: {formula_str}",
         "-" * 70,
+        f"📅 Train Period   : {engine.start_date} ~ {engine.end_date}",
         f"📅 Test Period    : {test_start_str} ~ {test_end_str}",
         "-" * 70,
-        f"{'指標':<18} {'離散倉位 (±1)':<20} {'連續倉位 (Signal)':<20}",
+        f"{'指標':<18} {'離散倉位 (±1,0)':<20} {'連續倉位 (Signal)':<20}",
         "-" * 70,
         f"{'📈 Total Return':<18} {metrics_d['total_ret']:>18.2%} {metrics_c['total_ret']:>18.2%}",
         f"{'📈 Ann. Return':<18} {metrics_d['ann_ret']:>18.2%} {metrics_c['ann_ret']:>18.2%}",
@@ -738,8 +1031,44 @@ def final_reality_check(miner, engine):
         f"{'💰 Profit Factor':<18} {metrics_d['profit_factor']:>18.2f} {metrics_c['profit_factor']:>18.2f}",
         "-" * 70,
         "",
-        f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ]
+    
+    # 添加訓練歷史
+    if miner.history:
+        report_lines.extend([
+            "=" * 100,
+            "📜 TRAINING HISTORY - Best Formula Updates (Train Set Metrics)",
+            "=" * 100,
+            f"{'Iter':<6} {'Sortino':<10} {'Sharpe':<10} {'Return':<10} {'WinRate':<10} {'Formula':<50}",
+            "-" * 100,
+        ])
+        for record in miner.history:
+            iteration = record['iteration']
+            sortino = record['sortino']
+            sharpe = record.get('sharpe')
+            total_ret = record.get('total_ret')
+            win_rate = record.get('win_rate')
+            formula_hist_str = record['formula_str']
+            
+            sharpe_str = f"{sharpe:.2f}" if sharpe is not None else "N/A"
+            ret_str = f"{total_ret:.1%}" if total_ret is not None else "N/A"
+            win_str = f"{win_rate:.1%}" if win_rate is not None else "N/A"
+            
+            if len(formula_hist_str) > 48:
+                formula_display = formula_hist_str[:45] + "..."
+            else:
+                formula_display = formula_hist_str
+            report_lines.append(f"{iteration:<6} {sortino:<10.2f} {sharpe_str:<10} {ret_str:<10} {win_str:<10} {formula_display:<50}")
+        report_lines.extend([
+            "-" * 100,
+            f"Total Updates: {len(miner.history)} times",
+            "",
+        ])
+    
+    report_lines.extend([
+        f"Output Folder: {output_folder}",
+        f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ])
     
     with open(report_file, 'w', encoding='utf-8') as f:
         f.write('\n'.join(report_lines))
@@ -748,7 +1077,19 @@ def final_reality_check(miner, engine):
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='AlphaGPT US Stock Factor Mining')
+    parser = argparse.ArgumentParser(
+        description='AlphaGPT US Stock Factor Mining',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+交易邏輯：
+  T日收盤信號 → T+1開盤建倉 → 持有直到信號改變
+  收益計算: Close-to-Close 日收益
+
+使用範例：
+  python times_us.py --symbol SPY
+  python times_us.py --symbol NVDA --iterations 600
+        """
+    )
     parser.add_argument('--symbol', type=str, default=DEFAULT_SYMBOL, 
                         help='Stock/ETF symbol (e.g., SPY, AAPL, QQQ)')
     parser.add_argument('--start', type=str, default=START_DATE, 
@@ -761,33 +1102,43 @@ if __name__ == "__main__":
                         help='Training iterations')
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE,
                         help='Batch size')
+    parser.add_argument('--threshold', type=float, default=DEFAULT_SIGNAL_THRESHOLD,
+                        help=f'Signal threshold for discrete position (default: {DEFAULT_SIGNAL_THRESHOLD}). '
+                             f'|signal| < threshold → hold (position=0)')
     args = parser.parse_args()
 
     # 更新全局配置
     TRAIN_ITERATIONS = args.iterations
     BATCH_SIZE = args.batch_size
 
-    print("="*60)
+    # 創建獨立輸出文件夾
+    output_folder = create_output_folder(args.symbol)
+    
+    print("="*70)
     print("🚀 AlphaGPT - US Stock Factor Mining")
-    print("="*60)
-    print(f"Symbol     : {args.symbol}")
-    print(f"Train      : {args.start} ~ {args.end}")
-    print(f"Test       : {args.end} ~ {args.test_end}")
-    print(f"Device     : {DEVICE}")
-    print("="*60)
+    print("="*70)
+    print(f"Symbol        : {args.symbol}")
+    print(f"Threshold     : ±{args.threshold} (|signal| < {args.threshold} → 觀望)")
+    print(f"Train Period  : {args.start} ~ {args.end}")
+    print(f"Test Period   : {args.end} ~ {args.test_end}")
+    print(f"Device        : {DEVICE}")
+    print(f"Output Folder : {output_folder}")
+    print("="*70)
 
     # 加載數據
     engine = USDataEngine(args.symbol, args.start, args.end, args.test_end)
     engine.load()
 
-    # 訓練
-    miner = DeepQuantMiner(engine)
+    # 訓練（傳入信號閾值）
+    miner = DeepQuantMiner(engine, signal_threshold=args.threshold)
     miner.train()
 
-    # 回測報告
-    final_reality_check(miner, engine)
+    # 回測報告（傳入輸出文件夾）
+    final_reality_check(miner, engine, output_folder)
 
     # 清理緩存文件
     if os.path.exists(engine.cache_path):
         os.remove(engine.cache_path)
         print(f"🗑️  Deleted cache file: {engine.cache_path}")
+    
+    print(f"\n✅ All outputs saved to: {output_folder}")

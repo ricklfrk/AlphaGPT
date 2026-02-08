@@ -212,12 +212,18 @@ class DeepQuantMiner:
         return mask
 
     def solve_one(self, tokens):
+        """
+        解析並執行因子公式
+        
+        注意：時序算子期望輸入是 [B, T] 形狀，所以需要 unsqueeze/squeeze 處理
+        """
         stack = []
         try:
             # 倒序解析 (Reverse Polish like)
             for t in reversed(tokens):
                 if t < len(FEATURES):
-                    stack.append(self.engine.feat_data[t])
+                    # 特徵是 [T] 形狀，unsqueeze 成 [1, T] 供時序算子使用
+                    stack.append(self.engine.feat_data[t].unsqueeze(0))
                 else:
                     arity = OP_ARITY_MAP[t]
                     if len(stack) < arity: raise ValueError
@@ -231,6 +237,9 @@ class DeepQuantMiner:
 
             if len(stack) >= 1:
                 final = stack[-1]
+                # squeeze 回 [T] 形狀
+                if final.dim() == 2 and final.shape[0] == 1:
+                    final = final.squeeze(0)
                 # 过滤掉常数因子
                 if final.std() < 1e-4: return None
                 return final
